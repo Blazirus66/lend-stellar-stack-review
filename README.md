@@ -16,5 +16,10 @@ This repository provides an overview of the architecture and system design used 
 
 Additional diagrams describing the system are available in the repository:
 
-- `lend on Stellar - Tokenization.pdf`
-- `lend on Stellar - User journey.pdf`
+## Tokenization Architecture
+
+![Tokenization](./lend-tokenization.png)
+
+## User Journey
+
+![User Journey](./lend-user-journey.png)
