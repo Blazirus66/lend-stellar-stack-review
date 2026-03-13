@@ -187,6 +187,7 @@ This mechanism ensures that the share price remains stable in EUR terms while ac
 
 ## Operation lifecycle
 
+```
 +----------------------+
 |   Operation Created  |
 | Factory deploys      |
@@ -269,6 +270,7 @@ This mechanism ensures that the share price remains stable in EUR terms while ac
 | until full / paused  |
 | / canceled           |
 +----------------------+
+```
 
 ---
 
