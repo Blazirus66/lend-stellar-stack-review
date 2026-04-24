@@ -182,25 +182,21 @@ A key differentiator of the Lend protocol is the ability for investors to connec
 **Account linking:**
 
 ```mermaid
-graph TB
-    subgraph Account["Lend Platform Account<br/>(KYC verified — covers both wallets)"]
-        subgraph SW["Stellar Wallet<br/>Lobster / Freighter / xBull"]
-            S1["Invest"]
-            S2["Receive OpLend tokens"]
-            S3["Claim yields"]
-            S4["Sign transactions"]
-        end
-        subgraph EW["EVM Wallet (optional)<br/>Rabby / MetaMask"]
-            E1["Bridge USDC to Stellar"]
-            E2["Approve bridge transactions"]
-        end
+graph LR
+    subgraph Account["Lend Platform Account — KYC verified"]
+        direction LR
+        SW["🔵 Stellar Wallet<br/>Lobster / Freighter / xBull<br/><br/>• Invest<br/>• Receive OpLend tokens<br/>• Claim yields<br/>• Sign transactions"]
+        EW["🟣 EVM Wallet (optional)<br/>Rabby / MetaMask<br/><br/>• Bridge USDC to Stellar<br/>• Approve bridge transactions"]
     end
+
+    SW -.-|"linked under<br/>same account"| EW
 
     classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
     classDef evm fill:#f5eef8,stroke:#6c3483,color:#6c3483
+    classDef account fill:#f8f9fa,stroke:#2c3e50,color:#2c3e50
 
-    class S1,S2,S3,S4 stellar
-    class E1,E2 evm
+    class SW stellar
+    class EW evm
 ```
 
 Both wallets are linked to the same KYC-verified identity. The Stellar wallet is the primary wallet that receives OpLend tokens and weekly yield distributions. The EVM wallet is optional and used exclusively for cross-chain capital bridging.
