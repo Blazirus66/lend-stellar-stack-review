@@ -8,46 +8,55 @@ This document describes the full technical architecture of the Stellar integrati
 
 ## System Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         LEND PLATFORM                               │
-│                                                                     │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-│  │   Frontend    │    │   Backend    │    │   Stellar Network     │  │
-│  │              │    │   Worker     │    │                       │  │
-│  │  - Stellar   │◄──►│              │    │  ┌─────────────────┐  │  │
-│  │    Wallet Kit│    │  - Event     │◄──►│  │ Factory Contract│  │  │
-│  │  - Allbridge │    │    Indexer   │    │  │   (Soroban)     │  │  │
-│  │    SDK       │    │  - REST API  │    │  └────────┬────────┘  │  │
-│  │  - KYC Flow  │    │  - KYC Sig   │    │           │           │  │
-│  │              │    │    Generator │    │  ┌────────▼────────┐  │  │
-│  └──────┬───────┘    └──────────────┘    │  │ OpLend Tokens   │  │  │
-│         │                                │  │  (per operation)│  │  │
-│         │                                │  └─────────────────┘  │  │
-│         │                                │                       │  │
-│         │                                │  ┌─────────────────┐  │  │
-│         │                                │  │ Reflector Oracle│  │  │
-│         │                                │  │  (EUR/USDC)     │  │  │
-│         │                                │  └─────────────────┘  │  │
-│         │                                └───────────────────────┘  │
-│         │                                                           │
-│  ┌──────▼───────────────────────────────────────┐                   │
-│  │           Wallet Connection Layer             │                   │
-│  │                                               │                   │
-│  │  Stellar Wallet ──► Lobster / Freighter / xBull│                  │
-│  │  EVM Wallet    ──► Rabby / MetaMask            │                  │
-│  │                                               │                   │
-│  │  Both wallets linked under a single Lend       │                  │
-│  │  account for cross-chain operations            │                  │
-│  └───────────────────────────────────────────────┘                   │
-│                                                                     │
-│  ┌───────────────────────────────────────────────┐                   │
-│  │           Cross-Chain Bridge (Allbridge)       │                   │
-│  │                                               │                   │
-│  │  EVM USDC ──► Allbridge Core ──► Stellar USDC │                   │
-│  │  (Ethereum, Polygon, BSC, Arbitrum)           │                   │
-│  └───────────────────────────────────────────────┘                   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Frontend["Frontend"]
+        SWK["Stellar Wallet Kit"]
+        ABS["Allbridge SDK"]
+        KYC["KYC Flow"]
+    end
+
+    subgraph Worker["Backend Worker"]
+        IDX["Event Indexer"]
+        API["REST API"]
+        SIG["KYC Signature Generator"]
+    end
+
+    subgraph Stellar["Stellar Network"]
+        FC["Factory Contract<br/>(Soroban)"]
+        OPL["OpLend Tokens<br/>(per operation)"]
+        REF["Reflector Oracle<br/>(EUR/USDC)"]
+        FC --> OPL
+        FC --> REF
+    end
+
+    subgraph Wallets["Wallet Connection Layer"]
+        SW["Stellar Wallet<br/>Lobster / Freighter / xBull"]
+        EW["EVM Wallet<br/>Rabby / MetaMask"]
+    end
+
+    subgraph Bridge["Cross-Chain Bridge (Allbridge)"]
+        EVM["EVM USDC<br/>(Ethereum, Polygon, BSC, Arbitrum)"]
+        ALB["Allbridge Core"]
+        SUSDC["Stellar USDC"]
+        EVM --> ALB --> SUSDC
+    end
+
+    Frontend <--> Worker
+    Worker <--> Stellar
+    Frontend --> Wallets
+    Wallets --> Bridge
+    SUSDC --> FC
+
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    classDef frontend fill:#d5f5e3,stroke:#1e8449,color:#1e8449
+    classDef worker fill:#fef9e7,stroke:#f39c12,color:#b9770e
+    classDef bridge fill:#f5eef8,stroke:#6c3483,color:#6c3483
+
+    class FC,OPL,REF stellar
+    class SWK,ABS,KYC frontend
+    class IDX,API,SIG worker
+    class EVM,ALB,SUSDC bridge
 ```
 
 ---
@@ -83,22 +92,23 @@ The Factory is the primary entry point of the protocol. It orchestrates the full
 
 **Investment flow — signature verification:**
 
-```
-Investor                    Backend                     Factory Contract
-   │                           │                              │
-   ├── KYC submission ────────►│                              │
-   │                           ├── KYC/AML check             │
-   │                           ├── Generate signature ───┐    │
-   │◄── Signature ─────────────┤                         │    │
-   │                           │                         │    │
-   ├── invest(shares, signature) ────────────────────────┼───►│
-   │                           │                         │    ├── Verify signature
-   │                           │                         │    ├── Check whitelist
-   │                           │                         │    ├── Query oracle (EUR/USDC)
-   │                           │                         │    ├── Transfer USDC
-   │                           │                         │    ├── Mint OpLend tokens
-   │                           │                         │    ├── Emit Invested event
-   │◄── OpLend tokens ──────────────────────────────────────── │
+```mermaid
+sequenceDiagram
+    participant I as Investor
+    participant B as Backend
+    participant F as Factory Contract
+
+    I->>B: KYC submission
+    B->>B: KYC/AML check
+    B->>I: Signature (authorization)
+    I->>F: invest(shares, signature)
+    F->>F: Verify signature
+    F->>F: Check whitelist
+    F->>F: Query oracle (EUR/USDC)
+    F->>F: Transfer USDC
+    F->>F: Mint OpLend tokens
+    F->>F: Emit Invested event
+    F->>I: OpLend tokens
 ```
 
 ### 1.2 OpLend Token Contract (SEP-41)
@@ -141,14 +151,15 @@ Operations are priced in EUR while investors settle in USDC. The Factory integra
 
 **Implementation:**
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│   Factory    │────►│  Oracle Adapter  │────►│  Reflector   │
-│   Contract   │     │   (Soroban)      │     │  Network     │
-│              │◄────│                  │◄────│              │
-│  EUR amount  │     │  Converts to     │     │  EUR/USDC    │
-│  requested   │     │  USDC amount     │     │  live feed   │
-└─────────────┘     └──────────────────┘     └──────────────┘
+```mermaid
+graph LR
+    FC["Factory Contract<br/>EUR amount requested"] -->|query price| OA["Oracle Adapter<br/>(Soroban)"]
+    OA -->|fetch rate| RF["Reflector Network<br/>EUR/USDC live feed"]
+    RF -->|EUR/USDC rate| OA
+    OA -->|USDC amount| FC
+
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    class FC,OA,RF stellar
 ```
 
 ---
@@ -170,26 +181,26 @@ A key differentiator of the Lend protocol is the ability for investors to connec
 
 **Account linking:**
 
-```
-┌─────────────────────────────────────────────────┐
-│              Lend Platform Account               │
-│                                                  │
-│  ┌─────────────────┐  ┌──────────────────────┐  │
-│  │  Stellar Wallet  │  │    EVM Wallet         │  │
-│  │  (Lobster/       │  │    (Rabby/MetaMask)   │  │
-│  │   Freighter/     │  │                       │  │
-│  │   xBull)         │  │  Used for:            │  │
-│  │                  │  │  - Bridge USDC to     │  │
-│  │  Used for:       │  │    Stellar            │  │
-│  │  - Invest        │  │  - Approve bridge     │  │
-│  │  - Receive tokens│  │    transactions       │  │
-│  │  - Claim yields  │  │                       │  │
-│  │  - Sign txns     │  │                       │  │
-│  └─────────────────┘  └──────────────────────┘  │
-│                                                  │
-│  KYC verification linked to platform account     │
-│  (covers both wallets)                           │
-└─────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Account["Lend Platform Account<br/>(KYC verified — covers both wallets)"]
+        subgraph SW["Stellar Wallet<br/>Lobster / Freighter / xBull"]
+            S1["Invest"]
+            S2["Receive OpLend tokens"]
+            S3["Claim yields"]
+            S4["Sign transactions"]
+        end
+        subgraph EW["EVM Wallet (optional)<br/>Rabby / MetaMask"]
+            E1["Bridge USDC to Stellar"]
+            E2["Approve bridge transactions"]
+        end
+    end
+
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    classDef evm fill:#f5eef8,stroke:#6c3483,color:#6c3483
+
+    class S1,S2,S3,S4 stellar
+    class E1,E2 evm
 ```
 
 Both wallets are linked to the same KYC-verified identity. The Stellar wallet is the primary wallet that receives OpLend tokens and weekly yield distributions. The EVM wallet is optional and used exclusively for cross-chain capital bridging.
@@ -232,22 +243,20 @@ Allbridge Core is integrated to enable USDC transfers from EVM chains into Stell
 
 **Bridge flow:**
 
-```
-EVM Chain                    Allbridge                    Stellar
-┌──────────┐            ┌──────────────┐            ┌──────────────┐
-│ Investor │            │              │            │              │
-│ EVM      │──approve──►│  Allbridge   │            │              │
-│ Wallet   │──send─────►│  Core        │──mint─────►│  Investor    │
-│ (USDC)   │            │  Protocol    │  (USDC)    │  Stellar     │
-│          │            │              │            │  Wallet      │
-└──────────┘            └──────────────┘            └──────┬───────┘
-                                                          │
-                                                          ▼
-                                                   ┌──────────────┐
-                                                   │   Factory    │
-                                                   │   Contract   │
-                                                   │  (invest)    │
-                                                   └──────────────┘
+```mermaid
+graph LR
+    EVM["Investor EVM Wallet<br/>(USDC)"] -->|"1. approve"| ALB["Allbridge<br/>Core Protocol"]
+    EVM -->|"2. send USDC"| ALB
+    ALB -->|"3. mint USDC"| SW["Investor<br/>Stellar Wallet"]
+    SW -->|"4. invest"| FC["Factory<br/>Contract"]
+
+    classDef evm fill:#f5eef8,stroke:#6c3483,color:#6c3483
+    classDef bridge fill:#fef9e7,stroke:#f39c12,color:#b9770e
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+
+    class EVM evm
+    class ALB bridge
+    class SW,FC stellar
 ```
 
 ### 3.2 Frontend Integration
@@ -294,24 +303,22 @@ Compliance is **structural**, not declarative. It is enforced at the smart contr
 
 ### 4.3 Compliance Flow
 
-```
-┌──────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ Investor │     │  Lend        │     │  Compliance  │     │  Factory     │
-│          │     │  Backend     │     │  Provider    │     │  Contract    │
-│          │     │              │     │              │     │              │
-│ Submit   │────►│ Receive      │────►│ KYC/AML      │     │              │
-│ identity │     │ identity     │     │ screening    │     │              │
-│          │     │              │◄────│              │     │              │
-│          │     │ Generate     │     │ Result:      │     │              │
-│          │     │ signature    │     │ pass/fail    │     │              │
-│          │◄────│              │     │              │     │              │
-│          │     │              │     │              │     │              │
-│ invest() │─────────────────────────────────────────────►│ Verify sig   │
-│          │     │              │     │              │     │ Check        │
-│          │     │              │     │              │     │ whitelist    │
-│          │     │              │     │              │     │ Process      │
-│          │◄─────────────────────────────────────────────│ Mint tokens  │
-└──────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+```mermaid
+sequenceDiagram
+    participant I as Investor
+    participant B as Lend Backend
+    participant C as Compliance Provider
+    participant F as Factory Contract
+
+    I->>B: Submit identity
+    B->>C: KYC/AML screening
+    C->>B: Result (pass/fail)
+    B->>I: Signature (if passed)
+    I->>F: invest(shares, signature)
+    F->>F: Verify signature
+    F->>F: Check whitelist
+    F->>F: Process investment
+    F->>I: Mint OpLend tokens
 ```
 
 ---
@@ -364,16 +371,19 @@ The worker exposes a REST API consumed by the frontend:
 
 ### 5.6 Architecture
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Soroban RPC │     │   Backend    │     │   Frontend   │
-│  (events)    │────►│   Worker     │────►│   (React)    │
-│              │     │              │     │              │
-│  Horizon     │────►│  - Indexer   │     │  REST API    │
-│  (accounts)  │     │  - Database  │     │  consumer    │
-│              │     │  - API       │     │              │
-└──────────────┘     │  - KYC Sig   │     └──────────────┘
-                     └──────────────┘
+```mermaid
+graph LR
+    RPC["Soroban RPC<br/>(events)"] --> W["Backend Worker<br/>Indexer + Database<br/>API + KYC Signatures"]
+    HOR["Horizon<br/>(accounts)"] --> W
+    W --> FE["Frontend<br/>(React)<br/>REST API consumer"]
+
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    classDef worker fill:#fef9e7,stroke:#f39c12,color:#b9770e
+    classDef frontend fill:#d5f5e3,stroke:#1e8449,color:#1e8449
+
+    class RPC,HOR stellar
+    class W worker
+    class FE frontend
 ```
 
 ---
@@ -448,63 +458,27 @@ Stellar's anchor network provides exactly this. Multiple regulated anchors are a
 
 ## 9. Operation Lifecycle
 
-```
-┌──────────────────────┐
-│  Operation Created   │
-│  Factory deploys     │
-│  OpLend token        │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│  Funding Started     │
-│  Open for            │
-│  subscriptions       │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│  Investor Action     │
-│  Invest / Predeposit │
-└──────────┬───────────┘
-           │
-     ┌─────┴──────┐
-     │            │
-     ▼            ▼
-┌──────────┐  ┌──────────────┐
-│ Immediate│  │ Deferred     │
-│ mint     │  │ claim path   │
-│ OpLend   │  │ (predeposits)│
-└────┬─────┘  └──────┬───────┘
-     │               │
-     └───────┬───────┘
-             │
-             ▼
-┌──────────────────────┐
-│  Funding Complete?   │
-└──────────┬───────────┘
-           │
-     ┌─────┴─────┐
-     No         Yes
-     │           │
-     ▼           ▼
-┌──────────┐  ┌──────────────┐
-│ Continue │  │  Operation   │
-│ or pause │  │  Finished    │
-│ or cancel│  └──────┬───────┘
-└──────────┘         │
-                     ▼
-              ┌──────────────┐
-              │  Funds       │
-              │  Withdrawn   │
-              └──────────────┘
-                     │
-                     ▼
-              ┌──────────────┐
-              │  Weekly      │
-              │  Yield       │
-              │  Distribution│
-              └──────────────┘
+```mermaid
+graph TD
+    A["Operation Created<br/>Factory deploys OpLend token"] --> B["Funding Started<br/>Open for subscriptions"]
+    B --> C["Investor Action<br/>Invest / Predeposit"]
+    C --> D["Immediate mint<br/>OpLend tokens"]
+    C --> E["Deferred claim path<br/>(predeposits)"]
+    D --> F{"Funding Complete?"}
+    E --> F
+    F -->|No| G["Continue / Pause / Cancel"]
+    F -->|Yes| H["Operation Finished"]
+    H --> I["Funds Withdrawn"]
+    I --> J["Weekly Yield Distribution"]
+
+    classDef active fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    classDef decision fill:#fef9e7,stroke:#f39c12,color:#b9770e
+    classDef final fill:#d5f5e3,stroke:#1e8449,color:#1e8449
+
+    class A,B,C,D,E active
+    class F decision
+    class H,I,J final
+    class G active
 ```
 
 ---
