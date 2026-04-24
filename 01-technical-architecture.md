@@ -1,49 +1,527 @@
-# Technical Architecture
+# Technical Architecture — Lend Protocol on Stellar
 
-The Lend protocol on Stellar is built around a Soroban-based architecture designed to support compliant tokenized real-world asset financing.
+Lend is a compliant real estate tokenization protocol deployed on Stellar using Soroban smart contracts. The protocol enables investors to deploy stablecoins into professionally structured real estate operations, with programmable yield distribution and secondary market liquidity.
 
-The system relies on a **Factory contract** responsible for creating and managing tokenized investment operations. Each real estate financing opportunity is instantiated through this Factory, which deploys a dedicated **OpLend token** representing investor positions in the operation.
+This document describes the full technical architecture of the Stellar integration.
 
-These tokens act as tokenized bonds where each fraction of a token corresponds to a share of the underlying financing structure. The Factory manages the lifecycle of operations, defines supply parameters, links metadata describing the asset and emits protocol events used by the indexing infrastructure.
+---
 
-## Backend Worker and Event Indexing
+## System Overview
 
-To synchronize on-chain activity with the application state, Lend operates a backend **worker system** responsible for indexing protocol events.
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         LEND PLATFORM                               │
+│                                                                     │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
+│  │   Frontend    │    │   Backend    │    │   Stellar Network     │  │
+│  │              │    │   Worker     │    │                       │  │
+│  │  - Stellar   │◄──►│              │    │  ┌─────────────────┐  │  │
+│  │    Wallet Kit│    │  - Event     │◄──►│  │ Factory Contract│  │  │
+│  │  - Allbridge │    │    Indexer   │    │  │   (Soroban)     │  │  │
+│  │    SDK       │    │  - REST API  │    │  └────────┬────────┘  │  │
+│  │  - KYC Flow  │    │  - KYC Sig   │    │           │           │  │
+│  │              │    │    Generator │    │  ┌────────▼────────┐  │  │
+│  └──────┬───────┘    └──────────────┘    │  │ OpLend Tokens   │  │  │
+│         │                                │  │  (per operation)│  │  │
+│         │                                │  └─────────────────┘  │  │
+│         │                                │                       │  │
+│         │                                │  ┌─────────────────┐  │  │
+│         │                                │  │ Reflector Oracle│  │  │
+│         │                                │  │  (EUR/USDC)     │  │  │
+│         │                                │  └─────────────────┘  │  │
+│         │                                └───────────────────────┘  │
+│         │                                                           │
+│  ┌──────▼───────────────────────────────────────┐                   │
+│  │           Wallet Connection Layer             │                   │
+│  │                                               │                   │
+│  │  Stellar Wallet ──► Lobster / Freighter / xBull│                  │
+│  │  EVM Wallet    ──► Rabby / MetaMask            │                  │
+│  │                                               │                   │
+│  │  Both wallets linked under a single Lend       │                  │
+│  │  account for cross-chain operations            │                  │
+│  └───────────────────────────────────────────────┘                   │
+│                                                                     │
+│  ┌───────────────────────────────────────────────┐                   │
+│  │           Cross-Chain Bridge (Allbridge)       │                   │
+│  │                                               │                   │
+│  │  EVM USDC ──► Allbridge Core ──► Stellar USDC │                   │
+│  │  (Ethereum, Polygon, BSC, Arbitrum)           │                   │
+│  └───────────────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-The worker continuously reads events emitted by the Factory and OpLend contracts through the **Soroban RPC `getEvents` endpoint**. These events are decoded and persisted into the platform database, allowing the system to reconstruct the full protocol state including:
+---
 
-- funding progress
-- investor allocations
-- token minting events
-- operation lifecycle updates
+## 1. Smart Contracts (Soroban)
 
-The worker interacts with both **Soroban RPC** and **Horizon**.
+### 1.1 Factory Contract
 
-Soroban RPC is used for:
+The Factory is the primary entry point of the protocol. It orchestrates the full lifecycle of tokenized investment operations.
 
-- smart contract interaction
-- transaction simulation
-- event retrieval
+**Responsibilities:**
 
-Horizon provides complementary access to:
+- Create tokenized operations (deploy a new OpLend token contract per operation)
+- Manage funding state (open, pause, cancel, complete)
+- Process investor subscriptions with backend signature verification
+- Handle pre-deposits and token claims
+- Execute cancellation with automated investor refunds
+- Enable fund withdrawal by the operation issuer
+- Emit protocol events for off-chain indexing
 
-- account balances
-- transaction history
-- asset metadata
-- network-level data
+**Key functions:**
 
-## Why Soroban Smart Contracts Instead of Native Stellar Assets
+| Function | Description | Access |
+|----------|-------------|--------|
+| `create_operation` | Deploy new OpLend token, register operation | Admin |
+| `start_operation` | Open funding to investors | Admin |
+| `invest` | Subscribe to operation (requires backend signature) | Investor (whitelisted) |
+| `predeposit` | Reserve shares before operation starts | Investor (whitelisted) |
+| `claim_tokens` | Claim OpLend tokens from predeposit | Investor |
+| `cancel_operation` | Cancel operation, enable refunds | Admin |
+| `refund` | Refund investor after cancellation | Investor |
+| `withdraw_funds` | Withdraw raised capital to destination | Admin |
 
-Although Stellar provides a native asset issuance model, Lend deliberately chose to implement tokenized operations through **Soroban smart contracts rather than Stellar native assets**.
+**Investment flow — signature verification:**
 
-While the native asset model offers simplicity and efficiency, the Soroban-based architecture allows the protocol to maintain full control over the token lifecycle and embed additional logic directly into the token contracts.
+```
+Investor                    Backend                     Factory Contract
+   │                           │                              │
+   ├── KYC submission ────────►│                              │
+   │                           ├── KYC/AML check             │
+   │                           ├── Generate signature ───┐    │
+   │◄── Signature ─────────────┤                         │    │
+   │                           │                         │    │
+   ├── invest(shares, signature) ────────────────────────┼───►│
+   │                           │                         │    ├── Verify signature
+   │                           │                         │    ├── Check whitelist
+   │                           │                         │    ├── Query oracle (EUR/USDC)
+   │                           │                         │    ├── Transfer USDC
+   │                           │                         │    ├── Mint OpLend tokens
+   │                           │                         │    ├── Emit Invested event
+   │◄── OpLend tokens ──────────────────────────────────────── │
+```
 
-This approach enables:
+### 1.2 OpLend Token Contract (SEP-41)
 
-- transfer restrictions
-- compliance checks
-- supply controls
-- operation-specific logic
-- protocol-level event emission
+Each real estate operation deploys a dedicated OpLend token representing investor shares in the financing structure.
 
-Using programmable contracts also ensures that the Factory remains the canonical entry point for all tokenized operations and preserves architectural consistency with the existing Lend protocol design.
+**Interface:** Implements the Soroban Token Interface ([SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md)) with 9 standard functions + 6 admin functions.
+
+**Compliance features:**
+
+- **Whitelist-based transfers:** Only whitelisted addresses can send and receive tokens
+- **Blacklist enforcement:** Blocked addresses cannot interact with the token
+- **Capped supply:** Total supply is hard-capped to the operation's funding target
+- **Transfer restrictions:** All transfers validated against compliance rules before execution
+
+**Storage model:**
+
+| Data | Storage Type | Rationale |
+|------|-------------|-----------|
+| Admin, config | Instance | Shared across all calls, high access frequency |
+| Investor balances | Persistent | Must survive archival, per-user data |
+| Allowances | Temporary | Short-lived approvals, auto-cleanup acceptable |
+
+### 1.3 Oracle Integration (Reflector)
+
+Operations are priced in EUR while investors settle in USDC. The Factory integrates [Reflector](https://reflector.network/), Stellar's native oracle network, to dynamically convert share prices.
+
+**Flow:**
+
+1. Operation share price is defined in EUR at creation
+2. When an investor subscribes, the Factory queries the Reflector oracle adapter for the current EUR/USDC rate
+3. The required USDC amount is calculated: `shares × price_per_share_eur × eur_usdc_rate`
+4. The investor transfers the calculated USDC amount
+
+**Safety mechanisms:**
+
+- Price staleness check: reject if oracle data is older than a configurable threshold
+- Price deviation bounds: reject if price moves beyond acceptable range between simulation and execution
+- Fallback: operation can be paused if oracle is unavailable
+
+**Implementation:**
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
+│   Factory    │────►│  Oracle Adapter  │────►│  Reflector   │
+│   Contract   │     │   (Soroban)      │     │  Network     │
+│              │◄────│                  │◄────│              │
+│  EUR amount  │     │  Converts to     │     │  EUR/USDC    │
+│  requested   │     │  USDC amount     │     │  live feed   │
+└─────────────┘     └──────────────────┘     └──────────────┘
+```
+
+---
+
+## 2. Dual-Wallet Architecture
+
+A key differentiator of the Lend protocol is the ability for investors to connect both a Stellar wallet and an EVM wallet under a single platform account. This enables cross-chain capital onboarding while keeping investment settlement on Stellar.
+
+### 2.1 Wallet Connection
+
+**Stellar wallet:**
+- Connected via [Stellar Wallet Kit](https://stellarwalletskit.dev/)
+- Supported wallets: Lobster, Freighter, xBull
+- Used for: investing in operations, receiving OpLend tokens, claiming yields
+
+**EVM wallet:**
+- Connected via standard Web3 provider (Rabby, MetaMask)
+- Used for: bridging USDC from EVM chains to Stellar via Allbridge
+
+**Account linking:**
+
+```
+┌─────────────────────────────────────────────────┐
+│              Lend Platform Account               │
+│                                                  │
+│  ┌─────────────────┐  ┌──────────────────────┐  │
+│  │  Stellar Wallet  │  │    EVM Wallet         │  │
+│  │  (Lobster/       │  │    (Rabby/MetaMask)   │  │
+│  │   Freighter/     │  │                       │  │
+│  │   xBull)         │  │  Used for:            │  │
+│  │                  │  │  - Bridge USDC to     │  │
+│  │  Used for:       │  │    Stellar            │  │
+│  │  - Invest        │  │  - Approve bridge     │  │
+│  │  - Receive tokens│  │    transactions       │  │
+│  │  - Claim yields  │  │                       │  │
+│  │  - Sign txns     │  │                       │  │
+│  └─────────────────┘  └──────────────────────┘  │
+│                                                  │
+│  KYC verification linked to platform account     │
+│  (covers both wallets)                           │
+└─────────────────────────────────────────────────┘
+```
+
+Both wallets are linked to the same KYC-verified identity. The Stellar wallet is the primary wallet that receives OpLend tokens and weekly yield distributions. The EVM wallet is optional and used exclusively for cross-chain capital bridging.
+
+### 2.2 User Flows
+
+**Flow A — Stellar-native investor:**
+
+1. Connect Stellar wallet via Stellar Wallet Kit
+2. Complete KYC verification on platform
+3. Browse available real estate operations
+4. Invest USDC directly from Stellar wallet
+5. Receive OpLend tokens representing investment position
+6. Receive weekly yield distributions to Stellar wallet
+
+**Flow B — Cross-chain investor (EVM → Stellar):**
+
+1. Connect Stellar wallet via Stellar Wallet Kit
+2. Connect EVM wallet via Web3 provider (Rabby, MetaMask)
+3. Complete KYC verification on platform
+4. Browse available real estate operations
+5. Select investment amount → platform calculates USDC needed
+6. Approve USDC on EVM chain
+7. Allbridge bridges USDC from EVM to investor's Stellar wallet
+8. Factory contract processes investment from Stellar wallet
+9. Receive OpLend tokens on Stellar wallet
+10. Receive weekly yield distributions to Stellar wallet
+
+**Key principle:** The bridge is a one-way capital onboarding mechanism. Once USDC arrives on Stellar, all subsequent operations (investment, yield distribution, token transfers) happen natively on Stellar.
+
+---
+
+## 3. Cross-Chain Bridge (Allbridge Core)
+
+### 3.1 Architecture
+
+Allbridge Core is integrated to enable USDC transfers from EVM chains into Stellar. The bridge flow is embedded directly in the Lend frontend, presenting a seamless single-session experience.
+
+**Supported source chains:** Ethereum, Polygon, BSC, Arbitrum
+
+**Bridge flow:**
+
+```
+EVM Chain                    Allbridge                    Stellar
+┌──────────┐            ┌──────────────┐            ┌──────────────┐
+│ Investor │            │              │            │              │
+│ EVM      │──approve──►│  Allbridge   │            │              │
+│ Wallet   │──send─────►│  Core        │──mint─────►│  Investor    │
+│ (USDC)   │            │  Protocol    │  (USDC)    │  Stellar     │
+│          │            │              │            │  Wallet      │
+└──────────┘            └──────────────┘            └──────┬───────┘
+                                                          │
+                                                          ▼
+                                                   ┌──────────────┐
+                                                   │   Factory    │
+                                                   │   Contract   │
+                                                   │  (invest)    │
+                                                   └──────────────┘
+```
+
+### 3.2 Frontend Integration
+
+The Allbridge SDK is integrated into the Lend frontend. The user experience is:
+
+1. User selects an operation and investment amount
+2. If paying from EVM: connect EVM wallet, approve USDC, initiate bridge
+3. Frontend displays bridge progress with status updates
+4. Once USDC arrives on Stellar, the investment transaction is prepared
+5. User signs the Stellar transaction via Stellar Wallet Kit
+6. Investment is processed by the Factory contract
+
+The bridge and investment are presented as a single guided process, but they are technically two separate transactions (bridge + invest) to maintain clean separation of concerns.
+
+---
+
+## 4. Compliance Layer
+
+### 4.1 Regulatory Framework
+
+Lend operates under French financial regulation. Each tokenized operation requires a formal investment document (DIS — Document d'Information Synthétique) submitted to the Autorité des Marchés Financiers (AMF).
+
+### 4.2 On-Chain Compliance
+
+Compliance is **structural**, not declarative. It is enforced at the smart contract level:
+
+**Whitelist/Blacklist (Factory + OpLend):**
+- Only whitelisted addresses can invest through the Factory
+- Only whitelisted addresses can receive OpLend token transfers
+- Blacklisted addresses are blocked from all protocol interactions
+- Whitelist/blacklist managed by protocol admin
+
+**Backend Signature Authorization:**
+- Every investment requires a cryptographic signature generated by the backend
+- The backend only generates signatures after successful KYC/AML verification
+- The Factory contract verifies the signature on-chain before processing the investment
+- This creates a two-layer compliance gate: off-chain verification + on-chain enforcement
+
+**Identity linking:**
+- Each wallet address is associated with a declared identity (legal name, residential address)
+- Required for regulatory compliance: each tokenized bond position must be linked to a real-world investor identity
+- Sanctions and AML screening performed against relevant databases before signature generation
+
+### 4.3 Compliance Flow
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Investor │     │  Lend        │     │  Compliance  │     │  Factory     │
+│          │     │  Backend     │     │  Provider    │     │  Contract    │
+│          │     │              │     │              │     │              │
+│ Submit   │────►│ Receive      │────►│ KYC/AML      │     │              │
+│ identity │     │ identity     │     │ screening    │     │              │
+│          │     │              │◄────│              │     │              │
+│          │     │ Generate     │     │ Result:      │     │              │
+│          │     │ signature    │     │ pass/fail    │     │              │
+│          │◄────│              │     │              │     │              │
+│          │     │              │     │              │     │              │
+│ invest() │─────────────────────────────────────────────►│ Verify sig   │
+│          │     │              │     │              │     │ Check        │
+│          │     │              │     │              │     │ whitelist    │
+│          │     │              │     │              │     │ Process      │
+│          │◄─────────────────────────────────────────────│ Mint tokens  │
+└──────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+```
+
+---
+
+## 5. Backend Worker & Event Indexing
+
+### 5.1 Role
+
+The backend worker maintains an accurate off-chain representation of the protocol state by continuously indexing events emitted by the Factory and OpLend contracts.
+
+### 5.2 Data Sources
+
+| Source | Used For |
+|--------|----------|
+| **Soroban RPC** (`getEvents`) | Contract events, transaction simulation, contract invocation |
+| **Horizon** | Account balances, transaction history, asset metadata, network data |
+
+### 5.3 Indexed Events
+
+| Event | Source | Data |
+|-------|--------|------|
+| `OperationCreated` | Factory | Operation ID, name, total shares, price, OpLend token address |
+| `OperationStarted` | Factory | Operation ID, timestamp |
+| `OperationPaused` | Factory | Operation ID |
+| `OperationCanceled` | Factory | Operation ID |
+| `OperationFinished` | Factory | Operation ID, total funded |
+| `Invested` | Factory | Operation ID, investor address, shares, USDC amount |
+| `Predeposit` | Factory | Operation ID, investor address, shares |
+| `ClaimedOpToken` | Factory | Operation ID, investor address, token amount |
+| `Refunded` | Factory | Operation ID, investor address, USDC amount |
+
+### 5.4 Reconstructed State
+
+The worker reconstructs and maintains:
+
+- **Operations:** list, status, funding progress, metadata
+- **Investor positions:** allocations per operation, token balances, claimable amounts
+- **Protocol metrics:** TVL, total capital deployed, unique investors, operation count
+
+### 5.5 REST API
+
+The worker exposes a REST API consumed by the frontend:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /operations` | List all operations with status and funding progress |
+| `GET /operations/:id` | Operation details, investors, funding state |
+| `GET /investors/:address` | Investor positions across all operations |
+| `POST /invest/authorize` | Generate backend signature after KYC check |
+
+### 5.6 Architecture
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Soroban RPC │     │   Backend    │     │   Frontend   │
+│  (events)    │────►│   Worker     │────►│   (React)    │
+│              │     │              │     │              │
+│  Horizon     │────►│  - Indexer   │     │  REST API    │
+│  (accounts)  │     │  - Database  │     │  consumer    │
+│              │     │  - API       │     │              │
+└──────────────┘     │  - KYC Sig   │     └──────────────┘
+                     └──────────────┘
+```
+
+---
+
+## 6. Yield Distribution
+
+Lend distributes yields to investors on a weekly basis, entirely on-chain. This is a key reason for choosing Stellar: the low transaction costs (~0.00001 XLM per operation) make weekly distribution to thousands of investors economically viable.
+
+### 6.1 Distribution Mechanism
+
+1. Real estate operation generates revenue (rent, interest)
+2. Lend's asset management team processes the revenue off-chain
+3. Revenue is converted to USDC and deposited to the distribution wallet on Stellar
+4. Distribution is executed proportionally to each investor's OpLend token holdings
+5. USDC is sent directly to each investor's Stellar wallet
+
+### 6.2 Transparency
+
+All yield distributions are visible on-chain through Stellar Explorer. Investors can verify:
+- Distribution frequency and amounts
+- Proportional allocation relative to their holdings
+- Historical distribution record
+
+---
+
+## 7. Incentive Mechanism
+
+To encourage adoption and anchor capital on Stellar, Lend introduces a **1.25x multiplier on Lend Points** for investments executed on the Stellar instance during the first year.
+
+This incentive is designed to:
+- Position Stellar as the preferred chain for Lend investors
+- Drive early adoption and long-term user anchoring
+- Create a concrete mechanism for TVL growth on Stellar
+
+At this stage, incentives are limited to points-based rewards. This grant is strictly scoped to development and does not include capital allocation for yield subsidies.
+
+---
+
+## 8. Design Decisions
+
+### Why Soroban smart contracts over Stellar Classic Assets?
+
+Stellar supports native asset issuance through Classic Assets, but Lend chose Soroban for the following reasons:
+
+| Requirement | Classic Assets | Soroban | Choice |
+|------------|---------------|---------|--------|
+| Transfer restrictions (whitelist) | Limited (authorization flags) | Full programmability | Soroban |
+| Compliance hooks per transaction | Not possible | Custom logic in `invest()` | Soroban |
+| Supply cap enforcement | Manual | Built into contract | Soroban |
+| Operation-specific token logic | Not possible | Per-operation contract | Soroban |
+| Protocol event emission | Not available | Full event system | Soroban |
+| Backend signature verification | Not possible | Custom verification | Soroban |
+
+### Why Stellar over other networks?
+
+The primary strategic reason for choosing Stellar is its **anchor network (SEP-6/24)**.
+
+Lend targets European and international expansion with the ambition of onboarding investors who are **not crypto-native** — institutional LPs, family offices, traditional real estate investors. These investors need regulated fiat on/off-ramps: deposit euros, invest in tokenized real estate, withdraw yields in fiat.
+
+Stellar's anchor network provides exactly this. Multiple regulated anchors are already active across Europe and internationally, offering compliant fiat ramps integrated at the protocol level. This is a structural advantage that aligns naturally with Lend's positioning and target market.
+
+| Factor | Relevance for Lend |
+|--------|-------------------|
+| **Anchor network (SEP-6/24)** | **Primary reason.** Regulated fiat on/off-ramps for non-crypto-native investors. Enables European and international expansion. No equivalent on EVM. |
+| **Reflector oracle** | Native EUR/USDC oracle for EUR-denominated real estate pricing. |
+| **Soroban** | Programmable compliance for regulated securities (whitelist, KYC signatures, capped supply). |
+| **RWA ecosystem alignment** | Stellar's strategic focus on real-world assets (SDF 2026 roadmap: $1B in tokenized assets). |
+| **Transaction costs** | Economical weekly yield distribution to large investor bases. |
+| **Settlement speed** | 5-second finality for investment confirmation. |
+
+---
+
+## 9. Operation Lifecycle
+
+```
+┌──────────────────────┐
+│  Operation Created   │
+│  Factory deploys     │
+│  OpLend token        │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  Funding Started     │
+│  Open for            │
+│  subscriptions       │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  Investor Action     │
+│  Invest / Predeposit │
+└──────────┬───────────┘
+           │
+     ┌─────┴──────┐
+     │            │
+     ▼            ▼
+┌──────────┐  ┌──────────────┐
+│ Immediate│  │ Deferred     │
+│ mint     │  │ claim path   │
+│ OpLend   │  │ (predeposits)│
+└────┬─────┘  └──────┬───────┘
+     │               │
+     └───────┬───────┘
+             │
+             ▼
+┌──────────────────────┐
+│  Funding Complete?   │
+└──────────┬───────────┘
+           │
+     ┌─────┴─────┐
+     No         Yes
+     │           │
+     ▼           ▼
+┌──────────┐  ┌──────────────┐
+│ Continue │  │  Operation   │
+│ or pause │  │  Finished    │
+│ or cancel│  └──────┬───────┘
+└──────────┘         │
+                     ▼
+              ┌──────────────┐
+              │  Funds       │
+              │  Withdrawn   │
+              └──────────────┘
+                     │
+                     ▼
+              ┌──────────────┐
+              │  Weekly      │
+              │  Yield       │
+              │  Distribution│
+              └──────────────┘
+```
+
+---
+
+## 10. Deployment Architecture
+
+### Testnet (current)
+
+- Factory contract deployed on Soroban testnet
+- OpLend token contract deployed on Soroban testnet
+- Testnet address: [GAIOQM6QINN427MWFQUHJZGG6T6KOE2ZGLRS2DVYIUGUOBSREDHJNTQM](https://testnet.stellarchain.io/address/GAIOQM6QINN427MWFQUHJZGG6T6KOE2ZGLRS2DVYIUGUOBSREDHJNTQM)
+- Source code: [github.com/lendxyz/lend-contracts-soroban](https://github.com/lendxyz/lend-contracts-soroban)
+
+### Mainnet (planned)
+
+- Production deployment with hardened configuration
+- Backend worker indexing mainnet events
+- Reflector oracle on mainnet feeds
+- Allbridge configured for mainnet USDC
+- Security review of all contract parameters completed before deployment
